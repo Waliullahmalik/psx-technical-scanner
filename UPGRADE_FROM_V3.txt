@@ -1,0 +1,12 @@
+PSX TECHNICAL SCANNER v3.4 — SAFE UPGRADE
+
+1. Stop your previous Streamlit instance (Ctrl+C).
+2. Keep a complete backup of the old project.
+3. Extract this ZIP to a new folder.
+4. Copy old data/*.csv into the NEW data/ folder (not the other way around).
+5. Run: python -m pip install -r requirements.txt
+6. Run: python -m streamlit run app.py
+7. Check that usable-data count still matches your existing 100 stocks.
+8. Sidebar > Live PSX quotes > All imported stocks > Fetch Live PSX Rates.
+
+Historical CSVs are never overwritten by live quote fetching.

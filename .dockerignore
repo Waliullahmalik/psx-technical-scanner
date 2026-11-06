@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.git/
+*.zip
+output/screening.csv
+output/daily_update_report.csv
+output/backups/
+*.log
+.env
+.venv/
