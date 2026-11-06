@@ -1,9 +1,10 @@
-"""PSX scanner backtesting page.
+"""PSX scanner backtesting page (v1.1).
 Upload to GitHub: pages/1_Backtesting.py
 Requires existing scanner.py, data/*.csv, pandas, numpy and Streamlit.
 
 Research simulation: end-of-day signals, next-session open execution, fixed protective
 stops, conservative treatment when stop and target are both touched, and transaction costs.
+END_OF_DATA exits are marked censored and excluded from completed-trade statistics.
 No orders are placed.
 """
 from __future__ import annotations
@@ -144,6 +145,7 @@ def execute_trade(x: pd.DataFrame, signal_i: int, signal: dict, horizon: int, rr
         "Exit Date": x.iloc[exit_i].date.date().isoformat(),
         "Exit": round(exit_price, 4),
         "Exit Reason": reason,
+        "Trade Status": "CENSORED" if reason == "END_OF_DATA" else "COMPLETED",
         "Holding Bars": int(exit_i - entry_i + 1),
         "Gross Return %": round(gross_pct, 4),
         "Net Return %": round(net_pct, 4),
@@ -172,22 +174,52 @@ def run_symbol(symbol: str, frame: pd.DataFrame, strategy: str, score_limit: int
 
 
 def performance(trades: pd.DataFrame, label: str):
-    if trades.empty:
-        return {"Strategy": label, "Trades": 0, "Win Rate %": None, "Avg Net %": None,
-                "Avg Net R": None, "Profit Factor": None, "Target Hit %": None}
-    net = trades["Net Return %"]
+    """Only genuinely completed trades enter performance statistics.
+
+    END_OF_DATA is not an executed exit: its mark-to-market price and return remain
+    visible in the trade ledger, but must not be treated as realized P&L.
+    """
+    closed = trades.loc[trades["Trade Status"].eq("COMPLETED")] if not trades.empty else trades
+    base = {
+        "Strategy": label,
+        "Signals Entered": len(trades),
+        "Completed": len(closed),
+        "Censored": len(trades) - len(closed),
+        "Win Rate %": None,
+        "Avg Net %": None,
+        "Avg Net R": None,
+        "Profit Factor": None,
+        "Target Hit %": None,
+    }
+    if closed.empty:
+        return base
+    net = closed["Net Return %"]
     positives = net[net > 0].sum()
     negatives = -net[net < 0].sum()
     pf = positives / negatives if negatives > 0 else (float("inf") if positives > 0 else np.nan)
-    return {
-        "Strategy": label,
-        "Trades": len(trades),
+    base.update({
         "Win Rate %": round(100 * (net > 0).mean(), 2),
-        "Avg Net %": round(net.mean(), 3),
-        "Avg Net R": round(trades["Net R"].mean(), 3),
-        "Profit Factor": round(pf, 3) if np.isfinite(pf) else None,
-        "Target Hit %": round(100 * trades["Exit Reason"].isin(["TARGET", "TARGET_GAP"]).mean(), 2),
-    }
+        "Avg Net %": round(float(net.mean()), 3),
+        "Avg Net R": round(float(closed["Net R"].mean()), 3),
+        "Profit Factor": round(float(pf), 3) if np.isfinite(pf) else None,
+        "Target Hit %": round(100 * closed["Exit Reason"].isin(["TARGET", "TARGET_GAP"]).mean(), 2),
+    })
+    return base
+
+
+def stock_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    """Ticker and strategy results; censored trades never inflate closed P&L."""
+    columns = ["Symbol", "Strategy", "Signals Entered", "Completed", "Censored",
+               "Win Rate %", "Avg Net %", "Avg Net R", "Profit Factor", "Target Hit %"]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for (symbol, strategy), group in trades.groupby(["Symbol", "Strategy"], sort=True):
+        m = performance(group, strategy)
+        rows.append({"Symbol": symbol, **m})
+    out = pd.DataFrame(rows, columns=columns)
+    return out.sort_values(["Strategy", "Completed", "Symbol"],
+                           ascending=[True, False, True]).reset_index(drop=True)
 
 
 files = sorted(DATA.glob("*.csv")) if DATA.exists() else []
@@ -239,33 +271,54 @@ if failures:
             st.write(msg)
 trades = pd.DataFrame(all_trades)
 if trades.empty:
-    st.warning("No completed simulations. Try more stocks, longer histories or different settings.")
+    st.warning("No simulated entries. Try more stocks, longer histories or different settings.")
     st.stop()
 
 v1 = trades.loc[trades.Strategy == "V1"].copy()
 v2 = trades.loc[trades.Strategy == "V2"].copy()
-st.subheader("Strategy comparison")
+st.subheader("Strategy comparison — completed trades only")
 summary = pd.DataFrame([performance(v1, "V1: Original scanner"), performance(v2, "V2: Quality-filtered")])
 st.dataframe(summary, hide_index=True, use_container_width=True)
-st.caption("Profit factor is calculated from gross positive vs absolute negative *net trade percentage returns*, not from a portfolio equity curve. No capital allocation or portfolio drawdown is simulated.")
+st.caption(
+    "Completed = TARGET, TARGET_GAP, STOP, STOP_GAP or TIME_EXIT. "
+    "Censored = END_OF_DATA (insufficient future candles to finish the holding period); "
+    "these are excluded from win rate, average returns, profit factor and target hit rate. "
+    "Trade-level returns are net of the configured trading costs. No portfolio equity curve "
+    "or capital allocation is simulated."
+)
+
+closed = trades.loc[trades["Trade Status"] == "COMPLETED"].copy()
+censored = trades.loc[trades["Trade Status"] == "CENSORED"].copy()
+if not censored.empty:
+    st.warning(
+        f"{len(censored)} trades are END_OF_DATA / censored. The exit prices recorded "
+        "for these rows are last-known closing prices (mark-to-market only), not real exits. "
+        "Their returns are excluded from completed-trade metrics."
+    )
+if closed.empty:
+    st.info("No fully resolved trades in the chosen period. More historical future candles "
+            "are needed for an unbiased performance assessment.")
+
+st.subheader("Stock-wise profitability — completed trades")
+stockwise = stock_summary(trades)
+stock_filter = st.radio("Stock breakdown", ["Both", "V1", "V2"], horizontal=True, key="stock_filter")
+stock_view = stockwise if stock_filter == "Both" else stockwise.loc[stockwise.Strategy == stock_filter]
+st.dataframe(stock_view, hide_index=True, use_container_width=True)
+st.caption("Each stock is evaluated separately for V1 and V2. Stocks with only censored "
+           "trades show no calculated win rate or profit factor; small samples are unreliable.")
+st.download_button("Download stock-wise performance (CSV)",
+                   stock_view.to_csv(index=False).encode("utf-8"),
+                   file_name="psx_backtest_by_stock.csv", mime="text/csv")
 
 st.subheader("Individual trades")
-strategy_filter = st.radio("Show", ["Both", "V1", "V2"], horizontal=True)
+strategy_filter = st.radio("Show strategy", ["Both", "V1", "V2"], horizontal=True)
+completion_filter = st.radio("Trade status", ["All", "Completed", "Censored"], horizontal=True)
 view = trades if strategy_filter == "Both" else trades.loc[trades.Strategy == strategy_filter]
+if completion_filter != "All":
+    view = view.loc[view["Trade Status"] == completion_filter.upper()]
 view = view.sort_values(["Entry Date", "Symbol", "Strategy"], ascending=[False, True, True])
 st.dataframe(view, use_container_width=True, hide_index=True)
 st.download_button("Download trade results (CSV)", view.to_csv(index=False).encode("utf-8"),
                    file_name="psx_backtest_trades.csv", mime="text/csv")
 st.download_button("Download strategy comparison (CSV)", summary.to_csv(index=False).encode("utf-8"),
                    file_name="psx_backtest_summary.csv", mime="text/csv")
-
-if not view.empty:
-    st.subheader("Results by score band")
-    chart_data = view.copy()
-    chart_data["Score band"] = pd.cut(chart_data["Score"], bins=[0, 59, 69, 79, 89, 100],
-                                       labels=["0–59", "60–69", "70–79", "80–89", "90–100"])
-    band = chart_data.groupby(["Strategy", "Score band"], observed=True)["Net Return %"].agg(
-        Trades="count", Avg_Net_Pct="mean").reset_index()
-    st.dataframe(band, use_container_width=True, hide_index=True)
-
-st.warning("Limitations: OHLC candles cannot reveal intraday path. If stop and target are touched on the same bar, the stop wins. Gaps are simulated at the open. No dividends, corporate-action adjustments, real bid/ask quotes, or portfolio sizing are modeled. V2 thresholds must be evaluated out of sample before use.")
